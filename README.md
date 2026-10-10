@@ -3,6 +3,8 @@
 A 2-player local artillery game for **Batocera Linux** arcade cabinets, written in Python 3 +
 pygame.
 
+![STRIKE-19 gameplay](docs/screenshot.png)
+
 ## Controls
 
 Each arcade controller is a separate device (the first = Player 1, second = Player 2).

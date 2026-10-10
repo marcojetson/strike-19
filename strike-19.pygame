@@ -1,0 +1,680 @@
+#!/usr/bin/env python3
+"""STRIKE-19 - 2-player local artillery game for Batocera Linux arcade cabinets.
+
+Classic turn-based and brawl modes on destructible terrain, with air-drop
+crates and a single-use energy shield (3 turns in classic, 5 seconds in brawl). Two
+arcade controllers, keyboard fallback.
+
+Desktop test:   python3 strike-19.pygame --windowed
+"""
+import json
+import math
+import os
+import random
+import sys
+from functools import lru_cache
+
+import pygame
+
+GAME_DIR = os.path.dirname(os.path.abspath(__file__))  # launch directory isn't guaranteed
+sys.path.insert(0, GAME_DIR)                           # so `src` imports work from Batocera
+GAME_SLUG = 'strike-19'
+SAVE_FILE = os.path.join(GAME_DIR, GAME_SLUG + '-save.json')
+
+from src import entities, physics, terrain as terrain_mod
+from src.entities import Crate, FloatingText, Projectile, Tank, WEAPONS
+from src.input import Controls
+
+# ===== Tuning ============================================================
+SCREEN_WIDTH = 320
+MIN_SCREEN_HEIGHT, MAX_SCREEN_HEIGHT = 180, 220
+TURN_TIME = 15.0
+RELOAD_TIME = 2.5
+CRATE_INTERVAL = (5.0, 9.0)
+RESTART_DELAY = 0.8
+MENU, PLAY, OVER = 'menu', 'play', 'over'
+
+COLOR = {
+    'sky_top': (22, 26, 54), 'sky_bottom': (58, 66, 112), 'text': (255, 243, 214),
+    'shadow': (12, 10, 24), 'gold': (252, 196, 25), 'p1': (96, 184, 255), 'p2': (255, 108, 104),
+    'hp': (90, 210, 90), 'hp_low': (220, 70, 60), 'wind': (200, 214, 240), 'shield': (120, 220, 255),
+}
+MODE_LABEL = {'classic': 'CLASSIC', 'brawl': 'BRAWL'}
+
+IS_WINDOWED = '--windowed' in sys.argv
+
+
+def now_ms():
+    return pygame.time.get_ticks()
+
+
+def is_blink_on(period_ms):
+    return (now_ms() // period_ms) % 2 == 0
+
+
+def load_save():
+    try:
+        with open(SAVE_FILE) as file:
+            return json.load(file)
+    except (OSError, ValueError):
+        return {}
+
+
+def write_save(data):
+    try:
+        with open(SAVE_FILE, 'w') as file:
+            json.dump(data, file)
+    except OSError:
+        pass  # read-only share: progress just isn't saved
+
+
+# ===== Display ===========================================================
+def mixer_is_available():
+    try:
+        return pygame.mixer.get_init() is not None
+    except (NotImplementedError, pygame.error):
+        return False  # pygame built without SDL_mixer: run silently
+
+
+try:
+    pygame.mixer.pre_init(22050, -16, 1, 512)
+except NotImplementedError:
+    pass
+pygame.init()
+pygame.display.set_caption('STRIKE-19')
+
+desktop = pygame.display.Info()  # must be read before set_mode
+if IS_WINDOWED or not desktop.current_w:
+    screen_height = MIN_SCREEN_HEIGHT
+else:
+    screen_height = physics.clamp(round(SCREEN_WIDTH * desktop.current_h / desktop.current_w),
+                          MIN_SCREEN_HEIGHT, MAX_SCREEN_HEIGHT)
+
+
+def open_display():
+    size = (SCREEN_WIDTH, screen_height)
+    flags = pygame.SCALED | (0 if IS_WINDOWED else pygame.FULLSCREEN)
+    for attempt in ({'flags': flags, 'vsync': 1}, {'flags': flags}, {}):
+        try:
+            return pygame.display.set_mode(size, **attempt)
+        except (pygame.error, TypeError):
+            continue
+    raise SystemExit('could not open a display')
+
+
+screen = open_display()
+canvas = pygame.Surface((SCREEN_WIDTH, screen_height)).convert()   # scene drawn here, then shaken
+pygame.mouse.set_visible(False)
+
+
+@lru_cache(maxsize=1)
+def sky_gradient():
+    surface = pygame.Surface((SCREEN_WIDTH, screen_height))
+    top, bottom = COLOR['sky_top'], COLOR['sky_bottom']
+    for y in range(screen_height):
+        mix = y / max(1, screen_height - 1)
+        surface.fill(tuple(round(top[i] + (bottom[i] - top[i]) * mix) for i in range(3)), (0, y, SCREEN_WIDTH, 1))
+    return surface
+
+
+@lru_cache(maxsize=1)
+def shield_dome():
+    size = 40
+    surface = pygame.Surface((size, size), pygame.SRCALPHA)
+    radius = size // 2 - 2
+    pygame.draw.circle(surface, (*COLOR['shield'], 60), (size // 2, size // 2), radius)
+    pygame.draw.circle(surface, COLOR['shield'], (size // 2, size // 2), radius, 1)
+    return surface
+
+
+# ===== Pixel font (3x5, cached per string) ===============================
+PIXEL_FONT = {
+    'A': '.#./#.#/###/#.#/#.#', 'B': '##./#.#/##./#.#/##.', 'C': '.##/#../#../#../.##', 'D': '##./#.#/#.#/#.#/##.',
+    'E': '###/#../##./#../###', 'F': '###/#../##./#../#..', 'G': '.##/#../#.#/#.#/.##', 'H': '#.#/#.#/###/#.#/#.#',
+    'I': '###/.#./.#./.#./###', 'J': '..#/..#/..#/#.#/.#.', 'K': '#.#/#.#/##./#.#/#.#', 'L': '#../#../#../#../###',
+    'M': '#.#/###/###/#.#/#.#', 'N': '##./#.#/#.#/#.#/#.#', 'O': '.#./#.#/#.#/#.#/.#.', 'P': '##./#.#/##./#../#..',
+    'Q': '.#./#.#/#.#/##./.##', 'R': '##./#.#/##./#.#/#.#', 'S': '.##/#../.#./..#/##.', 'T': '###/.#./.#./.#./.#.',
+    'U': '#.#/#.#/#.#/#.#/###', 'V': '#.#/#.#/#.#/#.#/.#.', 'W': '#.#/#.#/###/###/#.#', 'X': '#.#/#.#/.#./#.#/#.#',
+    'Y': '#.#/#.#/.#./.#./.#.', 'Z': '###/..#/.#./#../###', '0': '###/#.#/#.#/#.#/###', '1': '.#./##./.#./.#./###',
+    '2': '##./..#/.#./#../###', '3': '##./..#/.#./..#/##.', '4': '#.#/#.#/###/..#/..#', '5': '###/#../##./..#/##.',
+    '6': '.##/#../###/#.#/###', '7': '###/..#/.#./.#./.#.', '8': '###/#.#/###/#.#/###', '9': '###/#.#/###/..#/##.',
+    ':': '.../.#./.../.#./...', '!': '.#./.#./.#./.../.#.', '.': '.../.../.../.../.#.', '-': '.../.../###/.../...',
+    '/': '..#/..#/.#./#../#..', '?': '##./..#/.#./.../.#.', "'": '.#./.#./.../.../...', '+': '.../.#./###/.#./...',
+    '%': '#.#/..#/.#./#../#.#', 'x': '#.#/#.#/.#./#.#/#.#', '=': '.../###/.../###/...',
+}
+GLYPH_PIXELS = {char: [(x, y) for y, row in enumerate(rows.split('/')) for x, cell in enumerate(row) if cell == '#']
+                for char, rows in PIXEL_FONT.items()}
+
+
+def text_width(text, size=1):
+    return len(text) * 4 * size - size
+
+
+@lru_cache(maxsize=1024)
+def text_surface(text, size, color, shadow):
+    surface = pygame.Surface((max(1, text_width(text, size) + size), 6 * size), pygame.SRCALPHA)
+    for layer_color, offset in ([(shadow, size)] if shadow else []) + [(color, 0)]:
+        for index, char in enumerate(text):
+            for px, py in GLYPH_PIXELS.get(char, ()):
+                surface.fill(layer_color, (index * 4 * size + px * size + offset, py * size + offset, size, size))
+    return surface
+
+
+def draw_text(text, x, y, size=1, color=COLOR['text'], align='left', shadow=COLOR['shadow']):
+    text = str(text).upper()
+    x -= {'center': text_width(text, size) / 2, 'right': text_width(text, size)}.get(align, 0)
+    canvas.blit(text_surface(text, size, color, shadow), (round(x), round(y)))
+
+
+def draw_bar(x, y, width, height, fraction, color, background=(30, 30, 46)):
+    canvas.fill(background, (round(x), round(y), width, height))
+    filled = round(physics.clamp(fraction, 0, 1) * (width - 2))
+    if filled:
+        canvas.fill(color, (round(x) + 1, round(y) + 1, filled, height - 2))
+
+
+# ===== Sound (pre-rendered WAVs in sounds/, all optional) =================
+def load_sounds(names):
+    if not mixer_is_available():
+        return {}
+    pygame.mixer.set_num_channels(16)
+    pygame.mixer.set_reserved(1)
+    loaded = {}
+    for name in names:
+        path = os.path.join(GAME_DIR, 'sounds', name + '.wav')
+        if os.path.exists(path):
+            loaded[name] = pygame.mixer.Sound(path)
+    return loaded
+
+
+sounds = load_sounds(['launch', 'explosion', 'shield', 'pickup', 'hurt', 'music'])
+
+
+def play_sound(name):
+    if name in sounds:
+        sounds[name].play()
+
+
+class Music:
+    def __init__(self):
+        self.channel = pygame.mixer.Channel(0) if mixer_is_available() else None
+
+    def play(self, name):
+        if self.channel and name in sounds:
+            self.channel.play(sounds[name], loops=-1)
+
+    def stop(self, fade_ms=300):
+        if self.channel:
+            self.channel.fadeout(fade_ms)
+
+
+music = Music()
+
+
+# ===== Game state ========================================================
+current_screen = MENU
+state = {}
+wins = None  # loaded after start_game is defined
+
+
+def make_terrain():
+    return terrain_mod.Terrain(SCREEN_WIDTH, screen_height, seed=random.randrange(1 << 30))
+
+
+def spawn_tanks(terrain):
+    tanks = []
+    for player, color in ((0, COLOR['p1']), (1, COLOR['p2'])):
+        x = 34 if player == 0 else SCREEN_WIDTH - 34
+        y = terrain.ground_below(x, 0)
+        tanks.append(Tank(x, screen_height - 1 if y is None else y, player, color))
+    return tanks
+
+
+def start_game(mode=None):
+    global current_screen
+    mode = mode or state.get('mode', 'classic')
+    terrain = make_terrain()
+    state.clear()
+    state.update(mode=mode, terrain=terrain, tanks=spawn_tanks(terrain), projectiles=[], crates=[],
+                 particles=[], texts=[], wind=physics.random_wind(random),
+                 turn=0, turn_timer=TURN_TIME, shot_flying=False, aim={0: set(), 1: set()},
+                 crate_timer=random.uniform(*CRATE_INTERVAL), shake=0.0, terrain_changed=False,
+                 winner=None, over_time=0.0)
+    current_screen = PLAY
+    music.play('music')
+
+
+def end_game(winner):
+    global wins, current_screen
+    state['winner'] = winner
+    state['over_time'] = 0.0
+    current_screen = OVER
+    if winner is not None:
+        wins[winner] = wins.get(winner, 0) + 1
+        write_save({'wins': wins})
+    music.stop()
+
+
+def fire(tank):
+    if not tank.can_fire():
+        tank.charging, tank.charge = False, 0.0
+        return
+    power = max(0.15, tank.charge)
+    vx, vy = physics.muzzle_velocity(tank.angle, power)
+    mx, my = tank.muzzle()
+    state['projectiles'].append(Projectile(mx, my, vx, vy, tank.weapon, tank.player))
+    tank.consume_ammo()
+    tank.charging, tank.charge = False, 0.0
+    if state['mode'] == 'brawl':
+        tank.reload = RELOAD_TIME
+    else:
+        state['shot_flying'] = True
+    play_sound('launch')
+
+
+def cycle_weapon(tank):
+    owned = [name for name in ('standard', 'mega', 'cluster', 'laser') if tank.ammo.get(name, 0) > 0]
+    if len(owned) > 1:
+        index = owned.index(tank.weapon) if tank.weapon in owned else 0
+        tank.weapon = owned[(index + 1) % len(owned)]
+
+
+# ===== Scenes: menu ======================================================
+def toggle_mode():
+    state['mode'] = 'brawl' if state.get('mode', 'classic') == 'classic' else 'classic'
+
+
+def on_press(player, action):
+    if current_screen == MENU:
+        if action == 'start':
+            start_game(state.get('mode', 'classic'))
+        elif action in ('left', 'right', 'up', 'down'):
+            toggle_mode()
+    elif current_screen == PLAY:
+        if action in ('left', 'right', 'up', 'down'):
+            if player is not None:
+                state['aim'][player].add(action)
+        elif action == 'fire' and _player_may_act(player):
+            tank = state['tanks'][player]
+            if not (state['mode'] == 'classic' and state['shot_flying']) and tank.can_fire():
+                tank.charging, tank.charge = True, 0.0
+        elif action == 'weapon' and player is not None:
+            cycle_weapon(state['tanks'][player])
+        elif action == 'shield' and player is not None:
+            tank = state['tanks'][player]
+            if tank.arm_shield(seconds=Tank.SHIELD_SECONDS if state['mode'] == 'brawl' else 0.0,
+                               turns=Tank.SHIELD_TURNS if state['mode'] == 'classic' else 0):
+                play_sound('shield')
+    elif current_screen == OVER:
+        if action in ('start', 'fire') and state['over_time'] > RESTART_DELAY:
+            current_screen_menu()
+
+
+def on_release(player, action):
+    if current_screen == PLAY and player is not None and action in ('left', 'right', 'up', 'down'):
+        state['aim'][player].discard(action)
+    if current_screen == PLAY and action == 'fire' and _player_may_act(player):
+        tank = state['tanks'][player]
+        if tank.charging:
+            fire(tank)
+
+
+def _player_may_act(player):
+    if player is None:
+        return False
+    return state.get('mode') == 'brawl' or player == state.get('turn')
+
+
+def current_screen_menu():
+    global current_screen
+    current_screen = MENU
+    state.clear()
+    state['mode'] = 'classic'
+
+
+controls = Controls(on_press, on_release)
+
+
+# ===== Scenes: play update ===============================================
+def handle_movement(dt):
+    for player, tank in enumerate(state['tanks']):
+        aim = state['aim'][player]
+        if 'left' in aim:
+            tank.rotate(1, Tank.TURN_RATE, dt)
+        if 'right' in aim:
+            tank.rotate(-1, Tank.TURN_RATE, dt)
+        toward_up = 1 if tank.angle < 90 else -1
+        if 'up' in aim:
+            tank.rotate(toward_up, Tank.FINE_RATE, dt)
+        if 'down' in aim:
+            tank.rotate(-toward_up, Tank.FINE_RATE, dt)
+
+
+def resolve_explosion(x, y, weapon, owner):
+    stats = WEAPONS[weapon]
+    terrain = state['terrain']
+    if weapon == 'laser':
+        for depth in range(0, int(terrain.height - y) + 8, 5):
+            terrain.carve(x, y + depth, 5)
+    else:
+        terrain.carve(x, y, stats['radius'])
+    state['terrain_changed'] = True
+    state['shake'] = min(7.0, state['shake'] + stats['radius'] * 0.16)
+    entities.spawn_explosion(state['particles'], x, y, stats['color'], count=10 + int(stats['radius']))
+    entities.spawn_smoke(state['particles'], x, y, 6)
+    play_sound('explosion')
+
+    radius = stats['blast']
+    for tank in state['tanks']:
+        if tank.player == owner:
+            continue
+        distance = physics.distance(x, y, *tank.center)
+        damage = physics.damage_falloff(distance, radius, stats['damage'])
+        applied = tank.take_damage(damage)
+        if applied > 0:
+            state['texts'].append(FloatingText('-' + str(int(applied)), tank.x, tank.y - 22, tank.color))
+            play_sound('hurt')
+            if tank.hp <= 0:
+                end_game(1 - tank.player)
+
+    for crate in list(state['crates']):
+        if physics.distance(x, y, crate.x, crate.y) < stats['blast'] + Crate.SIZE / 2:
+            grant_reward(crate, owner)
+            state['crates'].remove(crate)
+
+
+def grant_reward(crate, owner):
+    tank = state['tanks'][owner]
+    reward = crate.reward
+    if reward == 'repair':
+        tank.hp = min(Tank.MAX_HP, tank.hp + 25)
+        label = '+25 HP'
+    elif reward == 'mega':
+        tank.ammo['mega'] += 3
+        label = '+3 MEGA'
+    elif reward == 'cluster':
+        tank.ammo['cluster'] += 1
+        label = 'CLUSTER'
+    elif reward == 'laser':
+        tank.ammo['laser'] += 1
+        label = 'LASER'
+    else:
+        tank.shield_charges += 1
+        label = 'SHIELD +1'
+    state['texts'].append(FloatingText(label, crate.x, crate.y - 10, COLOR['gold']))
+    play_sound('pickup')
+
+
+def update_projectiles(dt):
+    terrain = state['terrain']
+    for projectile in list(state['projectiles']):
+        projectile.step(dt, state['wind'])
+
+        if projectile.weapon == 'cluster' and projectile.split_depth == 0 and projectile.at_apex():
+            state['projectiles'].remove(projectile)
+            _split_cluster(projectile)
+            continue
+
+        if projectile.x < -12 or projectile.x > SCREEN_WIDTH + 12 or projectile.y > terrain.height + 30:
+            state['projectiles'].remove(projectile)
+            continue
+
+        hit_tank = None
+        for tank in state['tanks']:
+            if tank.player == projectile.owner and projectile.age < 0.3:
+                continue
+            if physics.distance(projectile.x, projectile.y, *tank.center) < projectile.radius + Tank.WIDTH / 2:
+                hit_tank = tank
+                break
+        if hit_tank:
+            state['projectiles'].remove(projectile)
+            resolve_explosion(projectile.x, projectile.y, projectile.weapon, projectile.owner)
+            continue
+
+        hit_crate = next((c for c in state['crates']
+                          if physics.distance(projectile.x, projectile.y, c.x, c.y) < projectile.radius + Crate.SIZE), None)
+        if hit_crate:
+            state['projectiles'].remove(projectile)
+            grant_reward(hit_crate, projectile.owner)
+            state['crates'].remove(hit_crate)
+            entities.spawn_explosion(state['particles'], hit_crate.x, hit_crate.y, COLOR['gold'], 12, 70)
+            continue
+
+        if terrain.is_solid(projectile.x, projectile.y):
+            state['projectiles'].remove(projectile)
+            resolve_explosion(projectile.x, projectile.y, projectile.weapon, projectile.owner)
+
+
+def _split_cluster(projectile):
+    for index in range(physics.CLUSTER_FRAGMENTS):
+        spread = (index - (physics.CLUSTER_FRAGMENTS - 1) / 2) * 34
+        fragment = Projectile(projectile.x, projectile.y,
+                              projectile.vx + spread * 0.5, projectile.vy - random.uniform(10, 40),
+                              'cluster', projectile.owner, split_depth=1)
+        fragment.trail = list(projectile.trail)
+        state['projectiles'].append(fragment)
+
+
+def update_crates(dt):
+    state['crate_timer'] -= dt
+    if state['crate_timer'] <= 0:
+        reward = random.choice(Crate.REWARDS)
+        x = random.uniform(SCREEN_WIDTH * 0.3, SCREEN_WIDTH * 0.7)
+        state['crates'].append(Crate(x, -10, reward))
+        state['crate_timer'] = random.uniform(*CRATE_INTERVAL)
+    for crate in list(state['crates']):
+        crate.step(dt, state['terrain'])
+        if crate.landed:  # a crate that reaches the ground is lost
+            state['crates'].remove(crate)
+
+
+def settle_tanks():
+    """After terrain changes, drop any tank left hanging and apply fall damage."""
+    terrain = state['terrain']
+    for tank in state['tanks']:
+        ground = terrain.ground_below(tank.x, tank.y - Tank.HEIGHT)
+        if ground is None:
+            fall = tank.y
+            tank.y = float(terrain.height)
+        else:
+            fall = ground - tank.y
+            tank.y = float(ground)
+        if fall > 12:
+            applied = tank.take_damage((fall - 12) * 0.9)
+            if applied > 0:
+                state['texts'].append(FloatingText('FALL -' + str(int(applied)), tank.x, tank.y - 24, COLOR['hp_low']))
+                play_sound('hurt')
+                if tank.hp <= 0:
+                    end_game(1 - tank.player)
+
+
+def update(dt):
+    if current_screen == MENU:
+        return
+    if current_screen == OVER:
+        state['over_time'] += dt
+        state['particles'] = [p for p in state['particles'] if p.step(dt)]
+        return
+
+    for tank in state['tanks']:
+        tank.update(dt)
+    handle_movement(dt)
+
+    if state['mode'] == 'classic' and not state['shot_flying']:
+        state['turn_timer'] -= dt
+        if state['turn_timer'] <= 0:
+            end_turn()
+
+    update_projectiles(dt)
+    update_crates(dt)
+
+    if state['terrain_changed']:
+        settle_tanks()
+        state['terrain_changed'] = False
+
+    if state['mode'] == 'classic' and state['shot_flying'] and not state['projectiles']:
+        end_turn()
+
+    state['particles'] = [p for p in state['particles'] if p.step(dt)]
+    state['texts'] = [t for t in state['texts'] if t.step(dt)]
+    state['shake'] = max(0.0, state['shake'] - 24.0 * dt)
+
+
+def end_turn():
+    state['turn'] = 1 - state['turn']
+    state['turn_timer'] = TURN_TIME
+    state['shot_flying'] = False
+    for tank in state['tanks']:
+        tank.charging, tank.charge = False, 0.0
+        if tank.shield_turns > 0:            # classic shield: one turn per transition
+            tank.shield_turns -= 1
+
+
+# ===== Scenes: render ====================================================
+def render():
+    canvas.blit(sky_gradient(), (0, 0))
+    if current_screen == MENU:
+        render_menu()
+    else:
+        render_world()
+    offset = (0, 0)
+    if current_screen == PLAY and state['shake'] > 0:
+        offset = (round(random.uniform(-1, 1) * state['shake']), round(random.uniform(-1, 1) * state['shake']))
+    screen.fill((0, 0, 0))
+    screen.blit(canvas, offset)
+    pygame.display.flip()
+
+
+def render_menu():
+    draw_text('STRIKE-19', SCREEN_WIDTH / 2, 40, size=4, color=COLOR['gold'], align='center')
+    draw_text(MODE_LABEL[state.get('mode', 'classic')], SCREEN_WIDTH / 2, 96, size=2, align='center')
+    draw_text('< MODE >', SCREEN_WIDTH / 2, 116, align='center', color=COLOR['wind'])
+    if wins and (wins.get(0) or wins.get(1)):
+        draw_text('WINS  P1 ' + str(wins.get(0, 0)) + '   P2 ' + str(wins.get(1, 0)),
+                  SCREEN_WIDTH / 2, screen_height - 34, align='center')
+    if is_blink_on(500):
+        draw_text('PRESS START', SCREEN_WIDTH / 2, screen_height - 20, align='center', color=COLOR['gold'])
+
+
+def render_world():
+    terrain = state['terrain']
+    canvas.blit(terrain.surface, (0, 0))
+    render_crates()
+    render_tanks()
+    render_projectiles()
+    for particle in state['particles']:
+        alpha = physics.clamp(particle.life / particle.max_life, 0, 1)
+        color = tuple(int(c * (0.4 + 0.6 * alpha)) for c in particle.color)
+        canvas.fill(color, (round(particle.x), round(particle.y), particle.size, particle.size))
+    for text in state['texts']:
+        draw_text(text.text, text.x, text.y, color=text.color, align='center')
+    render_hud()
+    if current_screen == OVER:
+        render_over()
+
+
+def render_crates():
+    for crate in state['crates']:
+        x, y = round(crate.x), round(crate.y)
+        pygame.draw.line(canvas, (230, 230, 230), (x, y - 6), (x, y - 3))
+        canvas.fill((240, 240, 245), (x - 6, y - 12, 12, 5))
+        canvas.fill((150, 96, 46), (x - Crate.SIZE // 2, y - Crate.SIZE // 2, Crate.SIZE, Crate.SIZE))
+        canvas.fill((230, 200, 80), (x - Crate.SIZE // 2, y - 1, Crate.SIZE, 2))
+        canvas.fill((230, 200, 80), (x - 1, y - Crate.SIZE // 2, 2, Crate.SIZE))
+
+
+def render_tanks():
+    for tank in state['tanks']:
+        active = state['mode'] == 'brawl' or tank.player == state['turn']
+        color = (255, 255, 255) if tank.hit_flash > 0 else tank.color
+        left, top, width, height = tank.rect
+        px, py = tank.barrel_pivot()
+        mx, my = tank.muzzle()
+        pygame.draw.line(canvas, color, (px, py), (mx, my), 2)
+        canvas.fill(color, (left, top, width, height))
+        canvas.fill((20, 20, 30), (left + 3, top + 2, width - 6, 2))
+        pygame.draw.circle(canvas, color, (px, py), 3)
+
+        fraction = tank.hp / Tank.MAX_HP
+        hp_color = COLOR['hp'] if fraction > 0.35 else COLOR['hp_low']
+        draw_bar(tank.x - 11, top - 8, 22, 5, fraction, hp_color)
+        if tank.shielded:
+            dome = shield_dome()
+            canvas.blit(dome, (round(tank.x - dome.get_width() / 2), round(tank.center[1] - dome.get_height() / 2)),
+                        special_flags=pygame.BLEND_RGB_ADD)
+        if tank.charging:
+            draw_bar(tank.x - 11, top - 14, 22, 3, tank.charge, COLOR['gold'])
+        if active and state['mode'] == 'classic' and is_blink_on(700):
+            draw_text('v', tank.x, top - 14, color=tank.color, align='center')
+
+
+def render_projectiles():
+    for projectile in state['projectiles']:
+        for index, (tx, ty) in enumerate(projectile.trail):
+            fade = (index + 1) / len(projectile.trail)
+            color = tuple(int(c * fade) for c in projectile.color)
+            canvas.fill(color, (round(tx) - 1, round(ty) - 1, 2, 2))
+        radius = 3 if projectile.weapon == 'mega' else 2
+        canvas.fill(projectile.color, (round(projectile.x) - radius, round(projectile.y) - radius, radius * 2, radius * 2))
+
+
+def render_hud():
+    wind = state['wind']
+    draw_text('WIND', 4, 4, color=COLOR['wind'])
+    speed = int(round(abs(wind) / physics.WIND_MAX * 40))
+    label = 'CALM' if abs(wind) < 6 else ('E' if wind >= 0 else 'W') + ' ' + str(speed) + ' KM/H'
+    draw_text(label, 22, 4, color=COLOR['wind'])
+    for player, tank in enumerate(state['tanks']):
+        label = 'P' + str(player + 1) + ' ' + str(int(math.ceil(tank.hp))) + ' ' + tank.weapon.upper()
+        if tank.weapon != 'standard':
+            label += ' x' + str(tank.ammo[tank.weapon])
+        x = 4 if player == 0 else SCREEN_WIDTH - 4
+        align = 'left' if player == 0 else 'right'
+        active = state['mode'] == 'classic' and player == state['turn']
+        draw_text(label, x, screen_height - 20, color=COLOR['gold'] if active else tank.color, align=align)
+        shield_label = 'SHIELD ' + str(tank.shield_charges)
+        if tank.shielded:
+            shield_label += ' ' + (str(tank.shield_turns) + 'T' if tank.shield_turns > 0
+                                   else str(int(tank.shield_timer)) + 'S')
+        draw_text(shield_label, x, screen_height - 8, color=COLOR['shield'], align=align)
+    if state['mode'] == 'classic':
+        seconds = max(0, int(math.ceil(state['turn_timer'])))
+        draw_text('P' + str(state['turn'] + 1) + ' ' + str(seconds), SCREEN_WIDTH / 2, screen_height - 20,
+                  align='center', color=COLOR['gold'])
+    else:
+        for player, tank in enumerate(state['tanks']):
+            x = 4 if player == 0 else SCREEN_WIDTH - 4
+            align = 'left' if player == 0 else 'right'
+            draw_bar(x if player == 0 else x - 40, screen_height - 13, 40, 4,
+                     1 - tank.reload / RELOAD_TIME, tank.color)
+
+
+def render_over():
+    overlay = pygame.Surface((SCREEN_WIDTH, screen_height), pygame.SRCALPHA)
+    overlay.fill((6, 6, 14, 170))
+    canvas.blit(overlay, (0, 0))
+    if state['winner'] is None:
+        draw_text('DRAW', SCREEN_WIDTH / 2, 60, size=3, align='center')
+    else:
+        color = COLOR['p1'] if state['winner'] == 0 else COLOR['p2']
+        draw_text('PLAYER ' + str(state['winner'] + 1) + ' WINS', SCREEN_WIDTH / 2, 60, size=2,
+                  color=color, align='center')
+    if state['over_time'] > RESTART_DELAY and is_blink_on(450):
+        draw_text('PRESS START', SCREEN_WIDTH / 2, 96, align='center', color=COLOR['gold'])
+
+
+# ===== Main loop =========================================================
+def main():
+    clock = pygame.time.Clock()
+    while True:
+        for event in pygame.event.get():
+            controls.handle(event)
+        update(min(1 / 30, clock.tick(60) / 1000))
+        render()
+
+
+wins = {int(k): int(v) for k, v in load_save().get('wins', {}).items()} or {0: 0, 1: 0}
+state['mode'] = 'classic'
+
+if __name__ == '__main__':
+    main()

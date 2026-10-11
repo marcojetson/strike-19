@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""STRIKE-19 - 2-player local artillery game for Batocera Linux arcade cabinets.
+"""STRIKE-19 - local artillery game for Batocera Linux arcade cabinets.
 
 Classic turn-based and brawl modes on destructible terrain, with air-drop
-crates and a single-use energy shield (3 turns in classic, 5 seconds in brawl). Two
-arcade controllers, keyboard fallback.
+crates and a single-use energy shield (3 turns in classic, 5 seconds in brawl).
+Play 1 player against the CPU (easy/normal/hard) or 2 players, via arcade
+controllers or keyboard fallback.
 
 Desktop test:   python3 strike-19.pygame --windowed
 """
@@ -36,11 +37,20 @@ RESTART_DELAY = 0.8
 MENU, PLAY, OVER = 'menu', 'play', 'over'
 
 COLOR = {
-    'sky_top': (22, 26, 54), 'sky_bottom': (58, 66, 112), 'text': (255, 243, 214),
+    'text': (255, 243, 214),
     'shadow': (12, 10, 24), 'gold': (252, 196, 25), 'p1': (96, 184, 255), 'p2': (255, 108, 104),
     'hp': (90, 210, 90), 'hp_low': (220, 70, 60), 'wind': (200, 214, 240), 'shield': (120, 220, 255),
 }
+SKY_BANDS = ((22, 26, 54), (40, 46, 88), (60, 70, 122))  # retro flat sky, dithered seams
 MODE_LABEL = {'classic': 'CLASSIC', 'brawl': 'BRAWL'}
+MENU_ROWS = ('players', 'mode', 'difficulty')
+DIFFICULTY_LABEL = {'easy': 'EASY', 'normal': 'NORMAL', 'hard': 'HARD'}
+DIFFICULTY = {  # CPU aim error (degrees / power) and think time before firing
+    'easy': {'angle': 9.0, 'power': 0.14, 'delay': 1.6},
+    'normal': {'angle': 3.5, 'power': 0.06, 'delay': 1.0},
+    'hard': {'angle': 1.2, 'power': 0.03, 'delay': 0.6},
+}
+settings = {'players': 1, 'mode': 'classic', 'difficulty': 'normal', 'row': 0}
 
 IS_WINDOWED = '--windowed' in sys.argv
 
@@ -109,12 +119,17 @@ pygame.mouse.set_visible(False)
 
 
 @lru_cache(maxsize=1)
-def sky_gradient():
+def sky_background():
+    """Flat sky bands from a tiny palette, with a 1px checkerboard seam between them (retro dither)."""
     surface = pygame.Surface((SCREEN_WIDTH, screen_height))
-    top, bottom = COLOR['sky_top'], COLOR['sky_bottom']
-    for y in range(screen_height):
-        mix = y / max(1, screen_height - 1)
-        surface.fill(tuple(round(top[i] + (bottom[i] - top[i]) * mix) for i in range(3)), (0, y, SCREEN_WIDTH, 1))
+    band = screen_height / len(SKY_BANDS)
+    for index, color in enumerate(SKY_BANDS):
+        top, bottom = round(index * band), round((index + 1) * band)
+        surface.fill(color, (0, top, SCREEN_WIDTH, bottom - top))
+        if index + 1 < len(SKY_BANDS):
+            below, seam = SKY_BANDS[index + 1], bottom - 1
+            for x in range(SCREEN_WIDTH):
+                surface.set_at((x, seam), below if (x + seam) % 2 else color)
     return surface
 
 
@@ -172,6 +187,12 @@ def draw_bar(x, y, width, height, fraction, color, background=(30, 30, 46)):
     filled = round(physics.clamp(fraction, 0, 1) * (width - 2))
     if filled:
         canvas.fill(color, (round(x) + 1, round(y) + 1, filled, height - 2))
+
+
+def draw_arrow(cx, cy, direction, color, size=4):
+    back = cx + size if direction == 'left' else cx - size
+    tip = cx - size if direction == 'left' else cx + size
+    pygame.draw.polygon(canvas, color, [(back, cy - size), (back, cy + size), (tip, cy)])
 
 
 # ===== Sound (pre-rendered WAVs in sounds/, all optional) =================
@@ -233,10 +254,12 @@ def spawn_tanks(terrain):
 
 def start_game(mode=None):
     global current_screen
-    mode = mode or state.get('mode', 'classic')
+    mode = mode or settings['mode']
     terrain = make_terrain()
     state.clear()
-    state.update(mode=mode, terrain=terrain, tanks=spawn_tanks(terrain), projectiles=[], crates=[],
+    state.update(mode=mode, players=settings['players'], difficulty=settings['difficulty'],
+                 cpu={'planned': None, 'think': 0.0},
+                 terrain=terrain, tanks=spawn_tanks(terrain), projectiles=[], crates=[],
                  particles=[], texts=[], wind=physics.random_wind(random),
                  turn=0, turn_timer=TURN_TIME, shot_flying=False, aim={0: set(), 1: set()},
                  crate_timer=random.uniform(*CRATE_INTERVAL), shake=0.0, terrain_changed=False,
@@ -281,17 +304,39 @@ def cycle_weapon(tank):
 
 
 # ===== Scenes: menu ======================================================
-def toggle_mode():
-    state['mode'] = 'brawl' if state.get('mode', 'classic') == 'classic' else 'classic'
+def _is_cpu(player):
+    return settings['players'] == 1 and player == 1
+
+
+def player_label(player):
+    return 'CPU' if _is_cpu(player) else 'P' + str(player + 1)
+
+
+def cycle_setting(direction):
+    row = MENU_ROWS[settings['row']]
+    if row == 'players':
+        settings['players'] = 2 if settings['players'] == 1 else 1
+    elif row == 'mode':
+        settings['mode'] = 'brawl' if settings['mode'] == 'classic' else 'classic'
+    else:
+        order = ('easy', 'normal', 'hard')
+        index = order.index(settings['difficulty']) + (1 if direction == 'right' else -1)
+        settings['difficulty'] = order[index % len(order)]
 
 
 def on_press(player, action):
     if current_screen == MENU:
         if action == 'start':
-            start_game(state.get('mode', 'classic'))
-        elif action in ('left', 'right', 'up', 'down'):
-            toggle_mode()
+            start_game()
+        elif action == 'up':
+            settings['row'] = (settings['row'] - 1) % len(MENU_ROWS)
+        elif action == 'down':
+            settings['row'] = (settings['row'] + 1) % len(MENU_ROWS)
+        elif action in ('left', 'right'):
+            cycle_setting(action)
     elif current_screen == PLAY:
+        if _is_cpu(player):
+            return
         if action in ('left', 'right', 'up', 'down'):
             if player is not None:
                 state['aim'][player].add(action)
@@ -312,12 +357,13 @@ def on_press(player, action):
 
 
 def on_release(player, action):
-    if current_screen == PLAY and player is not None and action in ('left', 'right', 'up', 'down'):
-        state['aim'][player].discard(action)
-    if current_screen == PLAY and action == 'fire' and _player_may_act(player):
-        tank = state['tanks'][player]
-        if tank.charging:
-            fire(tank)
+    if current_screen == PLAY and not _is_cpu(player):
+        if player is not None and action in ('left', 'right', 'up', 'down'):
+            state['aim'][player].discard(action)
+        elif action == 'fire' and _player_may_act(player):
+            tank = state['tanks'][player]
+            if tank.charging:
+                fire(tank)
 
 
 def _player_may_act(player):
@@ -330,7 +376,6 @@ def current_screen_menu():
     global current_screen
     current_screen = MENU
     state.clear()
-    state['mode'] = 'classic'
 
 
 controls = Controls(on_press, on_release, config_path=INPUT_FILE)
@@ -489,6 +534,74 @@ def settle_tanks():
                     end_game(1 - tank.player)
 
 
+def _simulate_landing(tank, angle, power):
+    """Step a shot with the same physics to find where it lands or hits. No side effects."""
+    vx, vy = physics.muzzle_velocity(angle, power)
+    radians = math.radians(angle)
+    px, py = tank.barrel_pivot()
+    x = px + math.cos(radians) * Tank.BARREL_LEN
+    y = py - math.sin(radians) * Tank.BARREL_LEN
+    radius = WEAPONS[tank.weapon]['radius'] + Tank.WIDTH / 2
+    step = 1 / 30
+    for _ in range(320):
+        vx += state['wind'] * step
+        vy += physics.GRAVITY * step
+        x += vx * step
+        y += vy * step
+        if x < -12 or x > SCREEN_WIDTH + 12 or y > state['terrain'].height + 40:
+            break
+        if any(other is not tank and physics.distance(x, y, *other.center) < radius for other in state['tanks']):
+            break
+        if state['terrain'].is_solid(x, y):
+            break
+    return x, y
+
+
+def _aim_shot(tank, target):
+    """Search the shot landing nearest the target, then blur it by the difficulty setting."""
+    low, high = (95, 170) if tank.player == 1 else (10, 85)
+
+    def search(angles, powers):
+        return min(((physics.distance(*_simulate_landing(tank, a, p), *target.center), a, p)
+                    for a in angles for p in powers), key=lambda candidate: candidate[0])
+
+    best = search(range(low, high + 1, 5), [i / 10 for i in range(3, 11)])
+    best = search(range(int(best[1]) - 5, int(best[1]) + 6, 2),
+                  [physics.clamp(best[2] + i / 40, 0.2, 1.0) for i in range(-4, 5)])
+    error = DIFFICULTY[state['difficulty']]
+    angle = physics.clamp(best[1] + random.uniform(-error['angle'], error['angle']),
+                          physics.ANGLE_MIN, physics.ANGLE_MAX)
+    power = physics.clamp(best[2] + random.uniform(-error['power'], error['power']), 0.2, 1.0)
+    return angle, power
+
+
+def update_cpu(dt):
+    """Player 2 is the computer in 1-player games: plan, rotate the barrel, then fire."""
+    if settings['players'] != 1:
+        return
+    cpu = state['cpu']
+    tank = state['tanks'][1]
+    if state['mode'] == 'classic':
+        active = state['turn'] == 1 and not state['shot_flying']
+    else:
+        active = tank.reload <= 0 and not state['projectiles']
+    if not active:
+        cpu['planned'] = None
+        return
+    if cpu['planned'] is None:
+        cpu['planned'] = _aim_shot(tank, state['tanks'][0])
+        cpu['think'] = DIFFICULTY[state['difficulty']]['delay']
+    angle, power = cpu['planned']
+    sweep = Tank.TURN_RATE * dt
+    tank.angle += physics.clamp(angle - tank.angle, -sweep, sweep)
+    cpu['think'] -= dt
+    if cpu['think'] <= 0 and not tank.charging:
+        tank.angle = angle
+        tank.charge = power
+        fire(tank)
+        cpu['planned'] = None
+
+
 def update(dt):
     if current_screen == MENU:
         return
@@ -500,6 +613,7 @@ def update(dt):
     for tank in state['tanks']:
         tank.update(dt)
     handle_movement(dt)
+    update_cpu(dt)
 
     if state['mode'] == 'classic' and not state['shot_flying']:
         state['turn_timer'] -= dt
@@ -533,7 +647,7 @@ def end_turn():
 
 # ===== Scenes: render ====================================================
 def render():
-    canvas.blit(sky_gradient(), (0, 0))
+    canvas.blit(sky_background(), (0, 0))
     if current_screen == MENU:
         render_menu()
     else:
@@ -547,9 +661,23 @@ def render():
 
 
 def render_menu():
-    draw_text('STRIKE-19', SCREEN_WIDTH / 2, 40, size=4, color=COLOR['gold'], align='center')
-    draw_text(MODE_LABEL[state.get('mode', 'classic')], SCREEN_WIDTH / 2, 96, size=2, align='center')
-    draw_text('< MODE >', SCREEN_WIDTH / 2, 116, align='center', color=COLOR['wind'])
+    draw_text('STRIKE-19', SCREEN_WIDTH / 2, 14, size=3, color=COLOR['gold'], align='center')
+    rows = (
+        ('PLAYERS', str(settings['players']) + ' PLAYER' + ('S' if settings['players'] == 2 else '')),
+        ('MODE', MODE_LABEL[settings['mode']]),
+        ('DIFFICULTY', DIFFICULTY_LABEL[settings['difficulty']]),
+    )
+    for index, (label, value) in enumerate(rows):
+        label_y = 46 + index * 28
+        value_y = label_y + 9
+        selected = index == settings['row']
+        color = COLOR['gold'] if selected else COLOR['text']
+        draw_text(label, SCREEN_WIDTH / 2, label_y, color=COLOR['wind'], align='center')
+        draw_text(value, SCREEN_WIDTH / 2, value_y, size=2, color=color, align='center')
+        if selected:
+            gap = text_width(value, 2) / 2 + 12
+            draw_arrow(SCREEN_WIDTH / 2 - gap, value_y + 5, 'left', color)
+            draw_arrow(SCREEN_WIDTH / 2 + gap, value_y + 5, 'right', color)
     if wins and (wins.get(0) or wins.get(1)):
         draw_text('WINS  P1 ' + str(wins.get(0, 0)) + '   P2 ' + str(wins.get(1, 0)),
                   SCREEN_WIDTH / 2, screen_height - 34, align='center')
@@ -626,7 +754,7 @@ def render_hud():
     label = 'CALM' if abs(wind) < 6 else ('E' if wind >= 0 else 'W') + ' ' + str(speed) + ' KM/H'
     draw_text(label, 22, 4, color=COLOR['wind'])
     for player, tank in enumerate(state['tanks']):
-        label = 'P' + str(player + 1) + ' ' + str(int(math.ceil(tank.hp))) + ' ' + tank.weapon.upper()
+        label = player_label(player) + ' ' + str(int(math.ceil(tank.hp))) + ' ' + tank.weapon.upper()
         if tank.weapon != 'standard':
             label += ' x' + str(tank.ammo[tank.weapon])
         x = 4 if player == 0 else SCREEN_WIDTH - 4
@@ -640,7 +768,7 @@ def render_hud():
         draw_text(shield_label, x, screen_height - 8, color=COLOR['shield'], align=align)
     if state['mode'] == 'classic':
         seconds = max(0, int(math.ceil(state['turn_timer'])))
-        draw_text('P' + str(state['turn'] + 1) + ' ' + str(seconds), SCREEN_WIDTH / 2, screen_height - 20,
+        draw_text(player_label(state['turn']) + ' ' + str(seconds), SCREEN_WIDTH / 2, screen_height - 20,
                   align='center', color=COLOR['gold'])
     else:
         for player, tank in enumerate(state['tanks']):
@@ -658,7 +786,7 @@ def render_over():
         draw_text('DRAW', SCREEN_WIDTH / 2, 60, size=3, align='center')
     else:
         color = COLOR['p1'] if state['winner'] == 0 else COLOR['p2']
-        draw_text('PLAYER ' + str(state['winner'] + 1) + ' WINS', SCREEN_WIDTH / 2, 60, size=2,
+        draw_text(player_label(state['winner']) + ' WINS', SCREEN_WIDTH / 2, 60, size=2,
                   color=color, align='center')
     if state['over_time'] > RESTART_DELAY and is_blink_on(450):
         draw_text('PRESS START', SCREEN_WIDTH / 2, 96, align='center', color=COLOR['gold'])
@@ -675,7 +803,6 @@ def main():
 
 
 wins = {int(k): int(v) for k, v in load_save().get('wins', {}).items()} or {0: 0, 1: 0}
-state['mode'] = 'classic'
 
 if __name__ == '__main__':
     main()

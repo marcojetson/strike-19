@@ -124,11 +124,35 @@ def check_play_through():
     assert game.current_screen in ('play', 'over')
 
 
+def check_cpu():
+    game = load_game()
+    game.settings.update(players=1, mode='classic', difficulty='hard', row=0)
+    game.start_game()
+    game.state['turn'] = 1                      # hand the turn to the CPU tank
+    fired = False
+    for _ in range(600):                        # hard difficulty thinks for 0.6 s
+        game.update(1 / 60)
+        if game.state['projectiles'] or game.state['shot_flying']:
+            fired = True
+            break
+    assert fired, 'the CPU should take a shot on its turn'
+
+    # a human button press must not drive the CPU tank
+    game.start_game()
+    game.settings.update(players=1, mode='classic')
+    assert game._is_cpu(1) and not game._is_cpu(0)
+    cpu = game.state['tanks'][1]
+    game.on_press(1, 'fire')
+    game.on_release(1, 'fire')
+    assert not cpu.charging and not game.state['projectiles']
+
+
 def main():
     check_physics()
     check_terrain()
     check_input()
     check_play_through()
+    check_cpu()
     print('smoke ok')
 
 

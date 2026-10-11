@@ -1,32 +1,9 @@
 # STRIKE-19
 
-A 2-player local artillery game for **Batocera Linux** arcade cabinets, written in Python 3 +
-pygame.
+A local artillery game for **Batocera Linux** arcade cabinets, written in Python 3 + pygame.
+Play 1 player against the CPU or 2 players, over classic or brawl modes.
 
 ![STRIKE-19 gameplay](docs/screenshot.png)
-
-## Controls
-
-Each arcade controller is a separate device (the first = Player 1, second = Player 2).
-Actions are mapped as: **A** fire/charge, **B** weapon select, **X/Y** shield, stick/D-pad
-to aim (horizontal) and fine-aim (vertical), **START** start, **BACK+START** (or Esc) exit.
-
-Keyboard fallback for desktop testing:
-
-| Action  | Player 1 | Player 2 |
-|---------|----------|----------|
-| Aim     | `A` / `D` | `←` / `→` |
-| Fine aim| `W` / `S` | `↑` / `↓` |
-| Fire    | `F`      | `K`      |
-| Weapon  | `G`      | `L`      |
-| Shield  | `H`      | `J`      |
-
-`START` = Enter or `1`, mode toggle = any aim key on the menu, exit = Esc.
-
-## Modes
-
-- **Classic** — alternating turns, 15-second turn clock.
-- **Brawl** — both players fire at will.
 
 ## Build & test
 

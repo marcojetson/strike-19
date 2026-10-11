@@ -20,6 +20,7 @@ GAME_DIR = os.path.dirname(os.path.abspath(__file__))  # launch directory isn't 
 sys.path.insert(0, GAME_DIR)                           # so `src` imports work from Batocera
 GAME_SLUG = 'strike-19'
 SAVE_FILE = os.path.join(GAME_DIR, GAME_SLUG + '-save.json')
+INPUT_FILE = os.path.join(GAME_DIR, 'input.json')
 
 from src import entities, physics, terrain as terrain_mod
 from src.entities import Crate, FloatingText, Projectile, Tank, WEAPONS
@@ -332,7 +333,7 @@ def current_screen_menu():
     state['mode'] = 'classic'
 
 
-controls = Controls(on_press, on_release)
+controls = Controls(on_press, on_release, config_path=INPUT_FILE)
 
 
 # ===== Scenes: play update ===============================================

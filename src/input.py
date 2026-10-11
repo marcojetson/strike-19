@@ -5,7 +5,13 @@ Actions are 'left', 'right', 'up', 'down', 'fire', 'weapon', 'shield', 'start', 
 start/back are global (player is None). Batocera can deliver one physical press twice, so a
 repeat of the same (player, action) within SAME_PRESS_WINDOW_MS counts once, and an action is
 released only when every input holding it has let go.
+
+Optional per-player overrides are read from an `input.json` beside the game, e.g.
+    {"1": {"invert": "y", "buttons": {"fire": 0, "weapon": 1}}}
+`invert` may contain 'x' and/or 'y' (flip a device whose axes are reversed); `buttons` maps
+action names to raw button indices.
 """
+import json
 import sys
 
 import pygame
@@ -57,18 +63,64 @@ class Controls:
     SAME_PRESS_WINDOW_MS = 80
     DEADZONE = 0.5
 
-    def __init__(self, on_press, on_release):
+    def __init__(self, on_press, on_release, config_path=None):
         self.on_press, self.on_release = on_press, on_release
         self.held_by = {}            # (player, action) -> set of sources
         self.last_press_ms = {}
         self.axis_dirs = {}          # player -> set of directions currently held (axes + hat)
         self.axis_values = {}        # player -> [x, y] latest analog values
         self.hat_dirs = {}           # player -> set of directions from a hat
+        self.axis_invert = {}        # player -> (invert_x, invert_y) from input.json
+        self.button_actions = {}     # player -> {button_index: action} from input.json
         self.instance_player = {}    # joystick instance_id -> player index
         self.game_controller_ids = set()
         self.devices = []
         self.sdl_controller = self._load_controller_module()
+        if config_path:
+            self.load_config(config_path)
         self.scan()
+
+    def load_config(self, path):
+        """Read optional per-player overrides; ignore a missing or malformed file."""
+        try:
+            with open(path) as file:
+                data = json.load(file)
+        except (OSError, ValueError):
+            return
+        players = data.get('players', data) if isinstance(data, dict) else None
+        for key, cfg in (players or {}).items():
+            try:
+                player = int(key) - 1
+            except (TypeError, ValueError):
+                continue
+            if player not in (0, 1) or not isinstance(cfg, dict):
+                continue
+            invert = str(cfg.get('invert', '')).lower()
+            self.axis_invert[player] = ('x' in invert, 'y' in invert)
+            buttons = cfg.get('buttons')
+            if isinstance(buttons, dict):
+                mapping = {}
+                for action, index in buttons.items():
+                    if str(action) not in ACTIONS:
+                        continue
+                    for single in (index if isinstance(index, list) else [index]):
+                        mapping[int(single)] = str(action)
+                self.button_actions[player] = mapping
+
+    def _orient(self, player, x, y):
+        invert_x, invert_y = self.axis_invert.get(player, (False, False))
+        return (-x if invert_x else x, -y if invert_y else y)
+
+    def _button_action(self, player, button):
+        override = self.button_actions.get(player, {})
+        if button in override:
+            return override[button]
+        action = {0: 'fire', 1: 'weapon', 2: 'shield', 3: 'shield'}.get(button)
+        if action is None and button == 7:
+            action = 'start'
+        elif action is None and button == 6:
+            action = 'back'
+        return action
 
     @staticmethod
     def _load_controller_module():
@@ -128,6 +180,7 @@ class Controls:
 
     def recompute_directions(self, player):
         x, y = self.axis_values.get(player, (0.0, 0.0))
+        x, y = self._orient(player, x, y)
         self.set_axis_directions(player, direction_from_axis(x, y, self.DEADZONE) | self.hat_dirs.get(player, set()))
 
     def handle(self, event):
@@ -136,16 +189,20 @@ class Controls:
         elif event.type in (pygame.KEYDOWN, pygame.KEYUP):
             if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
                 quit_game()
-            mapping = KEY_ACTIONS.get(event.key)
-            if mapping:
-                player, action = mapping
-                (self.press if event.type == pygame.KEYDOWN else self.release)(player, action, ('key', event.key))
+            # arcade encoders also emit emulated keyboard events; ignore them while real pads
+            # are present so a stick can't drive a second player
+            if pygame.joystick.get_count() == 0:
+                mapping = KEY_ACTIONS.get(event.key)
+                if mapping:
+                    player, action = mapping
+                    (self.press if event.type == pygame.KEYDOWN else self.release)(player, action, ('key', event.key))
         elif event.type in (getattr(pygame, 'CONTROLLERBUTTONDOWN', -1), getattr(pygame, 'CONTROLLERBUTTONUP', -1)):
             action = GC_BUTTONS.get(event.button)
             if action:
                 player = self.player_for(event.instance_id)
+                target = None if action in ('start', 'back') else player
                 source = ('pad', event.instance_id, event.button)
-                (self.press if event.type == pygame.CONTROLLERBUTTONDOWN else self.release)(player, action, source)
+                (self.press if event.type == pygame.CONTROLLERBUTTONDOWN else self.release)(target, action, source)
         elif event.type == getattr(pygame, 'CONTROLLERAXISMOTION', -1):
             player = self.player_for(event.instance_id)
             self._axis_moved(player, event.axis, event.value / 32767)
@@ -168,16 +225,14 @@ class Controls:
     def _handle_raw_joystick(self, event):
         player = self.player_for(event.instance_id)
         if event.type in (pygame.JOYBUTTONDOWN, pygame.JOYBUTTONUP):
-            action = {0: 'fire', 1: 'weapon', 2: 'shield', 3: 'shield'}.get(event.button)
-            if action is None and event.button >= 7:
-                action = 'start'
-            elif event.button in (6, 8):
-                action = 'back'
+            action = self._button_action(player, event.button)
             if action:
+                target = None if action in ('start', 'back') else player
                 source = ('joystick', event.instance_id, event.button)
-                (self.press if event.type == pygame.JOYBUTTONDOWN else self.release)(player, action, source)
+                (self.press if event.type == pygame.JOYBUTTONDOWN else self.release)(target, action, source)
         elif event.type == pygame.JOYAXISMOTION and event.axis in (0, 1):
             self._axis_moved(player, event.axis, event.value)
         elif event.type == pygame.JOYHATMOTION:
-            self.hat_dirs[player] = direction_from_axis(event.value[0], event.value[1], 0)
+            hx, hy = self._orient(player, event.value[0], event.value[1])
+            self.hat_dirs[player] = direction_from_axis(hx, hy, 0)
             self.recompute_directions(player)

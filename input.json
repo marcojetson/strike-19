@@ -1,0 +1,8 @@
+{
+  "1": {
+    "buttons": {"fire": 1, "weapon": 2, "shield": [0, 3], "start": 9, "back": 8}
+  },
+  "2": {
+    "buttons": {"fire": 1, "weapon": 2, "shield": [0, 3], "start": 9, "back": 8}
+  }
+}

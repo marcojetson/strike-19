@@ -8,7 +8,6 @@ controllers or keyboard fallback.
 
 Desktop test:   python3 strike-19.pygame --windowed
 """
-import json
 import math
 import os
 import random
@@ -20,7 +19,6 @@ import pygame
 GAME_DIR = os.path.dirname(os.path.abspath(__file__))  # launch directory isn't guaranteed
 sys.path.insert(0, GAME_DIR)                           # so `src` imports work from Batocera
 GAME_SLUG = 'strike-19'
-SAVE_FILE = os.path.join(GAME_DIR, GAME_SLUG + '-save.json')
 INPUT_FILE = os.path.join(GAME_DIR, 'input.json')
 
 from src import entities, physics, terrain as terrain_mod
@@ -61,22 +59,6 @@ def now_ms():
 
 def is_blink_on(period_ms):
     return (now_ms() // period_ms) % 2 == 0
-
-
-def load_save():
-    try:
-        with open(SAVE_FILE) as file:
-            return json.load(file)
-    except (OSError, ValueError):
-        return {}
-
-
-def write_save(data):
-    try:
-        with open(SAVE_FILE, 'w') as file:
-            json.dump(data, file)
-    except OSError:
-        pass  # read-only share: progress just isn't saved
 
 
 # ===== Display ===========================================================
@@ -178,7 +160,8 @@ def text_surface(text, size, color, shadow):
 
 def draw_text(text, x, y, size=1, color=COLOR['text'], align='left', shadow=COLOR['shadow']):
     text = str(text).upper()
-    x -= {'center': text_width(text, size) / 2, 'right': text_width(text, size)}.get(align, 0)
+    extent = text_width(text, size) + (size if shadow else 0)   # drop shadow widens the ink to the right
+    x -= {'center': extent / 2, 'right': extent}.get(align, 0)
     canvas.blit(text_surface(text, size, color, shadow), (round(x), round(y)))
 
 
@@ -209,7 +192,7 @@ def load_sounds(names):
     return loaded
 
 
-sounds = load_sounds(['launch', 'explosion', 'shield', 'pickup', 'hurt', 'music'])
+sounds = load_sounds(['launch', 'explosion', 'shield', 'pickup', 'hurt', 'win', 'lose', 'draw', 'music'])
 
 
 def play_sound(name):
@@ -236,7 +219,6 @@ music = Music()
 # ===== Game state ========================================================
 current_screen = MENU
 state = {}
-wins = None  # loaded after start_game is defined
 
 
 def make_terrain():
@@ -269,13 +251,16 @@ def start_game(mode=None):
 
 
 def end_game(winner):
-    global wins, current_screen
+    global current_screen
     state['winner'] = winner
     state['over_time'] = 0.0
     current_screen = OVER
-    if winner is not None:
-        wins[winner] = wins.get(winner, 0) + 1
-        write_save({'wins': wins})
+    if winner is None:
+        play_sound('draw')
+    elif settings['players'] == 1 and winner == 1:
+        play_sound('lose')
+    else:
+        play_sound('win')
     music.stop()
 
 
@@ -678,9 +663,6 @@ def render_menu():
             gap = text_width(value, 2) / 2 + 12
             draw_arrow(SCREEN_WIDTH / 2 - gap, value_y + 5, 'left', color)
             draw_arrow(SCREEN_WIDTH / 2 + gap, value_y + 5, 'right', color)
-    if wins and (wins.get(0) or wins.get(1)):
-        draw_text('WINS  P1 ' + str(wins.get(0, 0)) + '   P2 ' + str(wins.get(1, 0)),
-                  SCREEN_WIDTH / 2, screen_height - 34, align='center')
     if is_blink_on(500):
         draw_text('PRESS START', SCREEN_WIDTH / 2, screen_height - 20, align='center', color=COLOR['gold'])
 
@@ -783,13 +765,15 @@ def render_over():
     overlay.fill((6, 6, 14, 170))
     canvas.blit(overlay, (0, 0))
     if state['winner'] is None:
-        draw_text('DRAW', SCREEN_WIDTH / 2, 60, size=3, align='center')
+        headline, color = 'DRAW', COLOR['text']
+    elif settings['players'] == 1:
+        headline, color = ('YOU WIN', COLOR['gold']) if state['winner'] == 0 else ('YOU LOSE', COLOR['p2'])
     else:
-        color = COLOR['p1'] if state['winner'] == 0 else COLOR['p2']
-        draw_text(player_label(state['winner']) + ' WINS', SCREEN_WIDTH / 2, 60, size=2,
-                  color=color, align='center')
+        headline, color = player_label(state['winner']) + ' WINS', COLOR['p1'] if state['winner'] == 0 else COLOR['p2']
+    bob = round(math.sin(state['over_time'] * 6.0) * 2)
+    draw_text(headline, SCREEN_WIDTH / 2, 54 + bob, size=3, color=color, align='center')
     if state['over_time'] > RESTART_DELAY and is_blink_on(450):
-        draw_text('PRESS START', SCREEN_WIDTH / 2, 96, align='center', color=COLOR['gold'])
+        draw_text('PRESS START', SCREEN_WIDTH / 2, 100, align='center', color=COLOR['gold'])
 
 
 # ===== Main loop =========================================================
@@ -801,8 +785,6 @@ def main():
         update(min(1 / 30, clock.tick(60) / 1000))
         render()
 
-
-wins = {int(k): int(v) for k, v in load_save().get('wins', {}).items()} or {0: 0, 1: 0}
 
 if __name__ == '__main__':
     main()

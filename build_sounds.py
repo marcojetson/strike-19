@@ -28,6 +28,16 @@ def build():
                           (0.14, sweep_tone('square', 1319, 1319, 0.16, 0.16))),
         'hurt': layered((0, sweep_tone('sawtooth', 340, 90, 0.24, 0.22)),
                         (0, filtered_noise(0.16, 0.2, 300, 'lowpass'))),
+        'win': layered(*[(i * 0.13, music_note('square', note_to_frequency(n), 0.13, 0.18))
+                         for i, n in enumerate('C5 E5 G5 C6'.split())]
+                       + [(0.52, music_note('triangle', note_to_frequency(n), 0.6, 0.12))
+                          for n in 'C5 E5 G5 C6'.split()]),
+        'lose': layered((0, music_note('triangle', note_to_frequency('G4'), 0.22, 0.18)),
+                        (0.20, music_note('triangle', note_to_frequency('E4'), 0.22, 0.18)),
+                        (0.40, music_note('triangle', note_to_frequency('C4'), 0.55, 0.18)),
+                        (0.40, music_note('triangle', note_to_frequency('E4'), 0.55, 0.10))),
+        'draw': layered((0, music_note('square', note_to_frequency('E4'), 0.15, 0.16)),
+                        (0.18, music_note('square', note_to_frequency('C4'), 0.32, 0.16))),
     }
 
     events = [(i * beat, kick_drum(0.4)) for i in range(16)]

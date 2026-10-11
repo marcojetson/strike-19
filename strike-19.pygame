@@ -25,6 +25,8 @@ from src import entities, physics, terrain as terrain_mod
 from src.entities import Crate, FloatingText, Projectile, Tank, WEAPONS
 from src.input import Controls
 
+image_bytes = getattr(pygame.image, 'tobytes', None) or getattr(pygame.image, 'tostring', None)
+
 # ===== Tuning ============================================================
 SCREEN_WIDTH = 320
 MIN_SCREEN_HEIGHT, MAX_SCREEN_HEIGHT = 180, 220
@@ -43,10 +45,10 @@ SKY_BANDS = ((22, 26, 54), (40, 46, 88), (60, 70, 122))  # retro flat sky, dithe
 MODE_LABEL = {'classic': 'CLASSIC', 'brawl': 'BRAWL'}
 MENU_ROWS = ('players', 'mode', 'difficulty')
 DIFFICULTY_LABEL = {'easy': 'EASY', 'normal': 'NORMAL', 'hard': 'HARD'}
-DIFFICULTY = {  # CPU aim error (degrees / power) and think time before firing
-    'easy': {'angle': 9.0, 'power': 0.14, 'delay': 1.6},
-    'normal': {'angle': 3.5, 'power': 0.06, 'delay': 1.0},
-    'hard': {'angle': 1.2, 'power': 0.03, 'delay': 0.6},
+DIFFICULTY = {  # CPU aim error (deg / power), think time, and when it plays clever
+    'easy': {'angle': 9.0, 'power': 0.14, 'delay': 1.6, 'lock': 0.0, 'shield': 0.0},
+    'normal': {'angle': 3.0, 'power': 0.05, 'delay': 0.9, 'lock': 16.0, 'shield': 0.45},
+    'hard': {'angle': 0.8, 'power': 0.02, 'delay': 0.45, 'lock': 24.0, 'shield': 0.65},
 }
 settings = {'players': 1, 'mode': 'classic', 'difficulty': 'normal', 'row': 0}
 
@@ -240,7 +242,7 @@ def start_game(mode=None):
     terrain = make_terrain()
     state.clear()
     state.update(mode=mode, players=settings['players'], difficulty=settings['difficulty'],
-                 cpu={'planned': None, 'think': 0.0},
+                 cpu={'planned': None, 'think': 0.0, 'considered': False},
                  terrain=terrain, tanks=spawn_tanks(terrain), projectiles=[], crates=[],
                  particles=[], texts=[], wind=physics.random_wind(random),
                  turn=0, turn_timer=TURN_TIME, shot_flying=False, aim={0: set(), 1: set()},
@@ -519,45 +521,110 @@ def settle_tanks():
                     end_game(1 - tank.player)
 
 
-def _simulate_landing(tank, angle, power):
-    """Step a shot with the same physics to find where it lands or hits. No side effects."""
+def _simulate_landing(tank, angle, power, landscape):
+    """Step a shot with the same physics to where it lands or hits. No side effects.
+
+    `landscape` is the terrain alpha read once into bytes, so the per-step collision test is a
+    cheap index instead of a pygame pixel read (the search runs hundreds of trajectories)."""
+    alpha, width, height = landscape
     vx, vy = physics.muzzle_velocity(angle, power)
     radians = math.radians(angle)
     px, py = tank.barrel_pivot()
     x = px + math.cos(radians) * Tank.BARREL_LEN
     y = py - math.sin(radians) * Tank.BARREL_LEN
-    radius = WEAPONS[tank.weapon]['radius'] + Tank.WIDTH / 2
-    step = 1 / 30
-    for _ in range(320):
+    radius = WEAPONS['standard']['radius'] + Tank.WIDTH / 2
+    step = 1 / 60          # match the play loop's frame dt, or the aim lands short/long
+    for _ in range(480):
         vx += state['wind'] * step
         vy += physics.GRAVITY * step
         x += vx * step
         y += vy * step
-        if x < -12 or x > SCREEN_WIDTH + 12 or y > state['terrain'].height + 40:
+        if x < -12 or x > width + 12 or y > height + 40:
             break
         if any(other is not tank and physics.distance(x, y, *other.center) < radius for other in state['tanks']):
             break
-        if state['terrain'].is_solid(x, y):
+        xi, yi = int(x), int(y)
+        if 0 <= xi < width and 0 <= yi < height and alpha[(yi * width + xi) * 4 + 3] > terrain_mod.SOLID_ALPHA:
             break
     return x, y
 
 
+def _muzzle_at(tank, angle):
+    radians = math.radians(angle)
+    px, py = tank.barrel_pivot()
+    return px + math.cos(radians) * Tank.BARREL_LEN, py - math.sin(radians) * Tank.BARREL_LEN
+
+
+def _flight_candidates(launch, target, wind):
+    """Exact (angle, power) pairs that land on the target, one per flight time.
+
+    The game's Euler integration is closed-form: over T seconds the shell moves
+    T*v0 + a*(T^2 + T*h)/2, so for each T we can invert for the launch velocity and read off the
+    angle and power. No per-step search needed."""
+    dx = target.center[0] - launch[0]
+    dy = target.center[1] - launch[1]
+    span = physics.MUZZLE_MAX - physics.MUZZLE_MIN
+    gravity, step = physics.GRAVITY, 1 / 60
+    candidates = []
+    time = 0.35
+    while time <= 8.0:
+        k = (time * time + time * step) / 2
+        vx = (dx - wind * k) / time
+        vy = (dy - gravity * k) / time
+        power = (math.hypot(vx, vy) - physics.MUZZLE_MIN) / span
+        if 0.2 <= power <= 1.0:
+            candidates.append((math.degrees(math.atan2(-vy, vx)), power))
+        time += 0.08
+    return candidates
+
+
 def _aim_shot(tank, target):
-    """Search the shot landing nearest the target, then blur it by the difficulty setting."""
-    low, high = (95, 170) if tank.player == 1 else (10, 85)
+    """Pick the shot that reaches the target; returns (angle, power, miss_px)."""
+    surface = state['terrain'].surface
+    landscape = (image_bytes(surface, 'RGBA'), surface.get_width(), surface.get_height())
+    low, high = (95.0, 170.0) if tank.player == 1 else (10.0, 85.0)
 
-    def search(angles, powers):
-        return min(((physics.distance(*_simulate_landing(tank, a, p), *target.center), a, p)
-                    for a in angles for p in powers), key=lambda candidate: candidate[0])
+    candidates = [c for c in _flight_candidates(tank.barrel_pivot(), target, state['wind'])
+                  if low <= c[0] <= high]
+    if candidates:                          # re-solve from the real barrel tip, not the pivot
+        middle = sorted(candidates)[len(candidates) // 2][0]
+        better = [c for c in _flight_candidates(_muzzle_at(tank, middle), target, state['wind'])
+                  if low <= c[0] <= high]
+        candidates = better or candidates
+    if not candidates:                      # target out of reach: lob as close as we can
+        candidates = [(low, 0.6), ((low + high) / 2, 0.8), (high, 0.6)]
 
-    best = search(range(low, high + 1, 5), [i / 10 for i in range(3, 11)])
-    best = search(range(int(best[1]) - 5, int(best[1]) + 6, 2),
-                  [physics.clamp(best[2] + i / 40, 0.2, 1.0) for i in range(-4, 5)])
+    candidates.sort(reverse=True)           # steepest arcs clear hills best
+    best = (1e9, candidates[0][0], candidates[0][1])
+    for angle, power in candidates:
+        miss = physics.distance(*_simulate_landing(tank, angle, power, landscape), *target.center)
+        if miss < best[0]:
+            best = (miss, angle, power)
+        if miss < 6.0:
+            break                           # lands on the target: good enough
     error = DIFFICULTY[state['difficulty']]
     angle = physics.clamp(best[1] + random.uniform(-error['angle'], error['angle']),
                           physics.ANGLE_MIN, physics.ANGLE_MAX)
     power = physics.clamp(best[2] + random.uniform(-error['power'], error['power']), 0.2, 1.0)
-    return angle, power
+    return angle, power, best[0]
+
+
+def _cpu_weapon(tank, miss, lock):
+    """Once the shot is locked on, spend a heavy round instead of a plain shell."""
+    if miss < lock:
+        for name in ('mega', 'laser', 'cluster'):
+            if tank.ammo.get(name, 0) > 0:
+                return name
+    return 'standard'
+
+
+def _cpu_maybe_shield(tank, threshold):
+    if threshold <= 0 or tank.hp > Tank.MAX_HP * threshold:
+        return
+    brawl = state['mode'] == 'brawl'
+    if tank.arm_shield(seconds=Tank.SHIELD_SECONDS if brawl else 0.0,
+                       turns=Tank.SHIELD_TURNS if not brawl else 0):
+        play_sound('shield')
 
 
 def update_cpu(dt):
@@ -572,16 +639,22 @@ def update_cpu(dt):
         active = tank.reload <= 0 and not state['projectiles']
     if not active:
         cpu['planned'] = None
+        cpu['considered'] = False
         return
+    rules = DIFFICULTY[state['difficulty']]
+    if not cpu.get('considered'):
+        cpu['considered'] = True
+        _cpu_maybe_shield(tank, rules['shield'])
     if cpu['planned'] is None:
         cpu['planned'] = _aim_shot(tank, state['tanks'][0])
-        cpu['think'] = DIFFICULTY[state['difficulty']]['delay']
-    angle, power = cpu['planned']
+        cpu['think'] = rules['delay']
+    angle, power, miss = cpu['planned']
     sweep = Tank.TURN_RATE * dt
     tank.angle += physics.clamp(angle - tank.angle, -sweep, sweep)
     cpu['think'] -= dt
     if cpu['think'] <= 0 and not tank.charging:
         tank.angle = angle
+        tank.weapon = _cpu_weapon(tank, miss, rules['lock'])
         tank.charge = power
         fire(tank)
         cpu['planned'] = None

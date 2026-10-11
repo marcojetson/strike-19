@@ -146,6 +146,30 @@ def check_cpu():
     game.on_release(1, 'fire')
     assert not cpu.charging and not game.state['projectiles']
 
+    # the analytic solver must match a dense brute-force scan (and be far cheaper)
+    game.start_game()
+    cpu, foe = game.state['tanks'][1], game.state['tanks'][0]
+    surface = game.state['terrain'].surface
+    land = (game.image_bytes(surface, 'RGBA'), surface.get_width(), surface.get_height())
+    low, high = (95, 170) if cpu.player == 1 else (10, 85)
+
+    def miss(angle, power):
+        return game.physics.distance(*game._simulate_landing(cpu, angle, power, land), *foe.center)
+
+    scanned = min(miss(a, p) for a in range(low, high + 1, 5) for p in [i / 10 for i in range(3, 11)])
+    solved = min((miss(a, p) for a, p in game._flight_candidates(cpu.barrel_pivot(), foe, game.state['wind'])),
+                 default=999.0)
+    assert solved <= scanned + 5.0, (solved, scanned)
+
+    # clever tiers spend heavy rounds when locked on and raise the shield when hurt
+    cpu.ammo['mega'] = 2
+    assert game._cpu_weapon(cpu, 5.0, 24.0) == 'mega'
+    assert game._cpu_weapon(cpu, 5.0, 0.0) == 'standard'
+    cpu.hp = cpu.MAX_HP * 0.5
+    cpu.shield_charges = 1
+    game._cpu_maybe_shield(cpu, 0.65)
+    assert cpu.shielded, 'a hurt hard CPU should raise its shield'
+
 
 def main():
     check_physics()
